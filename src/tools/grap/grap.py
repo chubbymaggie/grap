@@ -7,7 +7,7 @@ import os
 import sys
 import argparse
 
-GRAP_VERSION="1.0.0"
+GRAP_VERSION="1.1.0"
 
 def main():
     sys.setrecursionlimit(1000000)
@@ -24,7 +24,8 @@ def main():
     parser.add_argument('-f', '--force', dest='force', action="store_true", default=False, help='Force re-generation of existing .grapcfg file')
     parser.add_argument('--raw', dest='raw_disas', action="store_true", default=False, help='Disassemble raw file')
     parser.add_argument('-r64', '--raw-64', dest='raw_64', action="store_true", default=False, help='Disassemble raw file with x86_64 (not default)')
-    parser.add_argument('-od', '--only-disassemble', dest='only_disassemble', action="store_true", default=False, help='Disassemble files and exit (no matching)')
+    parser.add_argument('-od', '--only-disassembly', dest='only_disassembly', action="store_true", default=False, help='Disassemble files and exit (no matching)')
+    parser.add_argument('-nd', '--no-disassembly', dest='no_disassembly', action="store_true", default=False, help='Skip file disassembly (will only match on .grapcfg files)')
     parser.add_argument('-o', '--cfg-output', dest='dot', help='Specify exported .grapcfg (DOT) file name (when there is only one test file) or directory')
     parser.add_argument('-er', '--readable', dest='readable', action="store_true", default=False, help='Export .grapcfg in displayable format (with xdot)')
     parser.add_argument('-t', '--timeout', dest='timeout', default=120, help='Specify timeout (in seconds) for disassembly, assign 0 for no timeout (default: 120)')
@@ -42,6 +43,8 @@ def main():
     pattern_paths = []
 
     if args.pattern is None or args.test is None:
+        if args.verbose:
+            print "ERROR: Missing pattern and test path."
         sys.exit(0)
 
     test_paths = []
@@ -51,6 +54,9 @@ def main():
             if args.recursive:
                 dot_test_files.add(test_path)
                 test_paths += list_files_recursively(test_path)
+            else:
+                if args.verbose:
+                    print "WARNING: Skipping directory", test_path
         else:
             test_paths.append((test_path, None))
 
@@ -62,13 +68,16 @@ def main():
             f.close()
         except IOError:
             if os.path.isdir(test_path):
-                print("Skipping directory " + test_path)
+                if args.verbose:
+                    print("WARNING: Skipping directory " + test_path)
             elif not os.path.isfile(test_path):
-                print("Skipping " + test_path + " (not found).")
+                if args.verbose:
+                    print("WARNING: Skipping " + test_path + " (not found).")
             continue
 
         if data is None:
-            print("WARNING: Can't open test file " + test_path)
+            if args.verbose:
+                print("WARNING: Test file could not be opened or is empty: " + test_path)
             continue
         else:
             if data[0:7].lower() == "digraph":
@@ -85,12 +94,12 @@ def main():
 
                 if os.path.exists(dot_path) and not args.force:
                     if args.verbose:
-                        print("Skipping generation of existing " + dot_path)
+                        print("WARNING: Skipping generation of existing " + dot_path)
                         printed_something = True
                     if dir_arg_path is None:
                         dot_test_files.add(dot_path)
                 else:
-                    if len(args.test) == 1 and args.dot is not None:
+                    if len(test_paths) == 1 and args.dot is not None:
                         found_path = pygrap.disassemble_file(bin_path=test_path, dot_path=dot_path,
                                                                    readable=args.readable, verbose=args.verbose,
                                                                    raw=args.raw_disas, raw_64=args.raw_64)
@@ -105,23 +114,33 @@ def main():
             sys.exit(0)
 
         files_to_disassemble = sorted(list(files_to_disassemble), key=lambda tup: tup[0])
-        disassembled_files = pygrap.disassemble_files(files_to_disassemble, ".grapcfg", dot_dir=args.dot, multiprocess=args.multithread,
+        disassembled_files = pygrap.disassemble_files(files_to_disassemble, ".grapcfg", dot_dir=args.dot,
+                                                            multiprocess=args.multithread and not args.no_disassembly,
                                                             n_processes=4, readable=args.readable, verbose=args.verbose,
-                                                            raw=args.raw_disas, raw_64=args.raw_64, timeout=args.timeout)
+                                                            raw=args.raw_disas, raw_64=args.raw_64, timeout=args.timeout,
+                                                            skip_disassembly = args.no_disassembly)
         for path in disassembled_files:
             dot_test_files.add(path)
 
-    if args.pattern is None or os.path.exists(args.pattern):
-        pattern_paths += compute_pattern_paths(args.pattern)
+    # Handling patterns (path or string that looks like a traversal)
+    if args.pattern_path is not None:
+        pattern_strings = [args.pattern] + [e[0] for e in args.pattern_path]
     else:
-        generated_pattern_path = pygrap.get_dot_path_from_string(args.pattern)
-        pattern_paths += compute_pattern_paths(generated_pattern_path)
+        pattern_strings = [args.pattern]
+    counter = 0
+    for p in pattern_strings:
+        if os.path.exists(p):
+            pattern_paths += compute_pattern_paths(p)
+        else:
+            generated_pattern_path = pygrap.get_dot_path_from_string(p, pattern_name="tmp"+str(counter))
+            pattern_paths += compute_pattern_paths(generated_pattern_path)
 
-        if args.verbose:
-            print "Inferred pattern path written:", pattern_path
+            if args.verbose:
+                print "Inferred pattern path written:", generated_pattern_path
+            counter += 1
 
     dot_test_files = sorted(list(dot_test_files))
-    if not args.only_disassemble:
+    if not args.only_disassembly:
         if len(pattern_paths) >= 1 and len(dot_test_files) >= 1:
             if printed_something or args.verbose:
                 print("")
@@ -152,7 +171,10 @@ def main():
             if not args.multithread:
                 command.append("-nt")
 
-            if args.recursive:
+            if args.recursive and args.dot is None:
+                # When specifying .grapcfg folder (args.dot):
+                # - All disassembled files are put flatly (no subfolder) in the folder
+                # - So grap-match should not try to match on subfolders
                 command.append("-r")
 
             command.append(pattern_paths[0])
@@ -160,14 +182,11 @@ def main():
                 command.append("-p")
                 command.append(p)
 
-            if args.pattern_path is not None:
-                for p in args.pattern_path:
-                    for l in compute_pattern_paths(p[0]):
-                        command.append("-p")
-                        command.append(l)
-
-            for test_path in dot_test_files:
-                command.append(test_path)
+            if args.dot is not None:
+                command.append(args.dot)
+            else:
+                for test_path in dot_test_files:
+                    command.append(test_path)
 
             if args.verbose or args.debug:
                 print(" ".join(command))
@@ -185,7 +204,7 @@ def main():
                 sys.exit(exitcode)
         else:
             if not args.quiet:
-                print("Missing pattern or test file.")
+                print("ERROR: Missing pattern or test file.")
 
 
 def compute_pattern_paths(path):
